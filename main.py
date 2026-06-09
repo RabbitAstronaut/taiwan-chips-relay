@@ -167,6 +167,11 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_csv(CSV_PATH)
         elif self.path == "/api/margin":
             self._serve_csv(MARGIN_PATH)
+        elif self.path == "/api/fetch_now":
+            # 手動觸發立即抓取
+            fetch_twse_chips()
+            fetch_twse_margin()
+            self._respond(200, {"status": "done", "chips": os.path.exists(CSV_PATH), "margin": os.path.exists(MARGIN_PATH)})
         else:
             self.send_error(404)
 
