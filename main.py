@@ -83,7 +83,9 @@ def fetch_twse_chips():
         df_final.to_csv(CSV_PATH, index=False)
         print(f"[{today}] 三大法人更新完成，共 {len(rows)} 筆")
     except Exception as e:
+        import traceback
         print(f"[chips] 錯誤：{e}")
+        traceback.print_exc()
 
 
 def fetch_twse_margin():
@@ -124,7 +126,9 @@ def fetch_twse_margin():
         df_final.to_csv(MARGIN_PATH, index=False)
         print(f"[{today}] 融資券更新完成，共 {len(rows)} 筆")
     except Exception as e:
+        import traceback
         print(f"[margin] 錯誤：{e}")
+        traceback.print_exc()
 
 
 def scheduler():
