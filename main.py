@@ -216,6 +216,104 @@ def fetch_margin(date_str=None):
 def fetch_futures(date_str=None):
     """爬取期交所三大法人未平倉（TX大台 + MTX小台）"""
     today, today_dash = parse_date(date_str)
+    print(f"[futures] 抓取 {today}", flush=True)
+    rows = []
+    try:
+        # 期交所公開靜態 CSV（當日資料，不需 session）
+        url = "https://www.taifex.com.tw/file/taifex/CHINESE/3/IT_futContractsDate.csv"
+        r = requests.get(url, headers=HDRS, timeout=15, verify=False)
+        print(f"[futures] status={r.status_code} len={len(r.content)}", flush=True)
+        r.encoding = "big5"
+        from io import StringIO
+        lines = r.text.splitlines()
+        print(f"[futures] 前5行={lines[:5]}", flush=True)
+
+        # 找 header 行
+        header_idx = next((i for i, l in enumerate(lines) if "身份別" in l or "商品名稱" in l), None)
+        if header_idx is None:
+            print(f"[futures] 找不到 header", flush=True)
+            return
+
+        df_raw = pd.read_csv(StringIO("\n".join(lines[header_idx:])), header=0)
+        df_raw.columns = [str(c).strip() for c in df_raw.columns]
+        print(f"[futures] 欄位={list(df_raw.columns[:6])}", flush=True)
+        print(f"[futures] 前3筆={df_raw.head(3)[df_raw.columns[:4]].to_string()}", flush=True)
+
+        contract_map = {"臺股期貨": "TX", "小型臺指期貨": "MTX"}
+        identity_map = {"自營商": "自營商", "投信": "投信",
+                        "外資及陸資": "外資", "外資": "外資"}
+        name_col = next((c for c in df_raw.columns if "商品" in c), None)
+        id_col   = next((c for c in df_raw.columns if "身份" in c), None)
+        date_col = next((c for c in df_raw.columns if "日期" in c), None)
+        if not name_col or not id_col:
+            print(f"[futures] 欄位缺失", flush=True)
+            return
+
+        # 篩選今日資料
+        if date_col:
+            df_raw[date_col] = df_raw[date_col].astype(str).str.strip()
+            today_str = f"{datetime.now(TZ_TW).year}/{datetime.now(TZ_TW).month:02d}/{datetime.now(TZ_TW).day:02d}"
+            df_today = df_raw[df_raw[date_col] == today_str]
+            if df_today.empty:
+                print(f"[futures] 無今日({today_str})資料，有日期={df_raw[date_col].unique()[-3:]}", flush=True)
+                df_today = df_raw  # fallback 用全部最新
+        else:
+            df_today = df_raw
+
+        for _, row in df_today.iterrows():
+            contract_name = str(row.get(name_col, "")).strip()
+            futures_id = contract_map.get(contract_name)
+            if not futures_id:
+                continue
+            identity = str(row.get(id_col, "")).strip()
+            identity_clean = identity_map.get(identity, "")
+            if not identity_clean:
+                continue
+
+            def _n(key):
+                col = next((c for c in df_raw.columns if key in c), None)
+                if col is None: return 0
+                try: return int(str(row.get(col, 0)).replace(",", "").strip())
+                except: return 0
+
+            rows.append({
+                "futures_id": futures_id,
+                "date": today_dash,
+                "institutional_investors": identity_clean,
+                "long_deal_volume":  _n("多方交易口數"),
+                "long_deal_amount":  _n("多方交易契約金額"),
+                "short_deal_volume": _n("空方交易口數"),
+                "short_deal_amount": _n("空方交易契約金額"),
+                "long_open_interest_balance_volume":  _n("多方未平倉口數"),
+                "long_open_interest_balance_amount":  _n("多方未平倉契約金額"),
+                "short_open_interest_balance_volume": _n("空方未平倉口數"),
+                "short_open_interest_balance_amount": _n("空方未平倉契約金額"),
+                "contract": futures_id,
+                "source": "institutional",
+            })
+
+        if not rows:
+            print(f"[futures] 解析無資料", flush=True)
+            return
+
+        df_new = pd.DataFrame(rows)
+        os.makedirs("data", exist_ok=True)
+        if os.path.exists(FUTURES_PATH):
+            df_old = pd.read_csv(FUTURES_PATH)
+            df_old = df_old[df_old["date"] != today_dash]
+            df_final = pd.concat([df_old, df_new], ignore_index=True)
+        else:
+            df_final = df_new
+        df_final.to_csv(FUTURES_PATH, index=False)
+        print(f"[futures] 寫入完成，共 {len(rows)} 筆", flush=True)
+        _push_to_github(FUTURES_PATH, "data/futures_data.csv")
+
+    except Exception as e:
+        import traceback
+        print(f"[futures] 錯誤：{e}", flush=True)
+        traceback.print_exc()
+    """爬取期交所三大法人未平倉（TX大台 + MTX小台）"""
+    today, today_dash = parse_date(date_str)
     try:
         dt = datetime.strptime(today, "%Y%m%d")
         query_date = f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
