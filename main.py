@@ -221,45 +221,58 @@ def fetch_futures(date_str=None):
         query_date = f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
     except:
         return
-    # 期交所 JSON API
-    url = "https://www.taifex.com.tw/cht/3/futContractsDate"
-    print(f"[futures] 抓取 {today}", flush=True)
+    url = f"https://www.taifex.com.tw/cht/3/futContractsDateDown?queryDate={query_date}&commodityId="
+    print(f"[futures] 抓取 {today} query_date={query_date}", flush=True)
     rows = []
     try:
-        r = requests.post(url, headers={**HDRS, "Accept": "application/json"},
-                          timeout=15, verify=False,
-                          data={"queryDate": query_date, "commodityId": ""})
-        # 嘗試 JSON 解析
-        try:
-            data = r.json()
-            items = data if isinstance(data, list) else data.get("data", [])
-        except Exception:
-            # JSON 失敗改用 CSV 下載端點
-            csv_url = f"https://www.taifex.com.tw/cht/3/futContractsDateDown?queryDate={query_date}&commodityId="
-            r2 = requests.get(csv_url, headers=HDRS, timeout=15, verify=False)
-            r2.encoding = "big5"
-            from io import StringIO
-            df_raw = pd.read_csv(StringIO(r2.text), header=1)
-            df_raw.columns = [str(c).strip() for c in df_raw.columns]
-            items = df_raw.to_dict("records")
+        r = requests.get(url, headers=HDRS, timeout=15, verify=False)
+        r.encoding = "big5"
+        from io import StringIO
+        # 跳過前幾行說明文字，找到 header 行
+        lines = r.text.splitlines()
+        print(f"[futures] 回應行數={len(lines)}, 前3行={lines[:3]}", flush=True)
+        # 找含有「商品名稱」或「身份別」的 header 行
+        header_idx = None
+        for i, line in enumerate(lines):
+            if "身份別" in line or "商品名稱" in line:
+                header_idx = i
+                break
+        if header_idx is None:
+            print(f"[futures] 找不到 header 行", flush=True)
+            return
+        csv_text = "\n".join(lines[header_idx:])
+        df_raw = pd.read_csv(StringIO(csv_text), header=0)
+        df_raw.columns = [str(c).strip() for c in df_raw.columns]
+        print(f"[futures] 欄位={list(df_raw.columns)}", flush=True)
+        print(f"[futures] 前3筆={df_raw.head(3).to_dict('records')}", flush=True)
 
         contract_map = {"臺股期貨": "TX", "小型臺指期貨": "MTX"}
         identity_map = {"自營商": "自營商", "投信": "投信",
                         "外資及陸資": "外資", "外資": "外資"}
 
-        for item in items:
-            contract_name = str(item.get("商品名稱", item.get("契約", ""))).strip()
+        # 找商品名稱欄和身份別欄
+        name_col = next((c for c in df_raw.columns if "商品" in c or "契約" in c), None)
+        id_col   = next((c for c in df_raw.columns if "身份" in c), None)
+        if not name_col or not id_col:
+            print(f"[futures] 找不到欄位 name_col={name_col} id_col={id_col}", flush=True)
+            return
+
+        for _, row in df_raw.iterrows():
+            contract_name = str(row.get(name_col, "")).strip()
             futures_id = contract_map.get(contract_name)
             if not futures_id:
                 continue
-            identity = str(item.get("身份別", "")).strip()
+            identity = str(row.get(id_col, "")).strip()
             identity_clean = identity_map.get(identity, identity)
             if identity_clean not in ("自營商", "投信", "外資"):
                 continue
 
             def _n(key):
+                col = next((c for c in df_raw.columns if key in c), None)
+                if col is None:
+                    return 0
                 try:
-                    return int(str(item.get(key, 0)).replace(",", "").strip())
+                    return int(str(row.get(col, 0)).replace(",", "").strip())
                 except:
                     return 0
 
@@ -268,27 +281,19 @@ def fetch_futures(date_str=None):
                 "date": today_dash,
                 "institutional_investors": identity_clean,
                 "long_deal_volume":  _n("多方交易口數"),
-                "long_deal_amount":  _n("多方交易契約金額(千元)"),
+                "long_deal_amount":  _n("多方交易契約金額"),
                 "short_deal_volume": _n("空方交易口數"),
-                "short_deal_amount": _n("空方交易契約金額(千元)"),
+                "short_deal_amount": _n("空方交易契約金額"),
                 "long_open_interest_balance_volume":  _n("多方未平倉口數"),
-                "long_open_interest_balance_amount":  _n("多方未平倉契約金額(千元)"),
+                "long_open_interest_balance_amount":  _n("多方未平倉契約金額"),
                 "short_open_interest_balance_volume": _n("空方未平倉口數"),
-                "short_open_interest_balance_amount": _n("空方未平倉契約金額(千元)"),
+                "short_open_interest_balance_amount": _n("空方未平倉契約金額"),
                 "contract": futures_id,
                 "source": "institutional",
             })
 
         if not rows:
             print(f"[futures] 解析無資料", flush=True)
-            # debug：印出實際欄位和前3筆
-            try:
-                if isinstance(items, list) and items:
-                    print(f"[futures] 欄位：{list(items[0].keys())}", flush=True)
-                    for item in items[:3]:
-                        print(f"[futures] 資料：{item}", flush=True)
-            except:
-                pass
             return
 
         df_new = pd.DataFrame(rows)
