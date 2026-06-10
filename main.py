@@ -429,7 +429,8 @@ class Handler(BaseHTTPRequestHandler):
             fetch_futures(date_str)
             self._respond(200,{"status":"done","date":date_str or "today",
                                "chips":os.path.exists(CSV_PATH),
-                               "margin":os.path.exists(MARGIN_PATH)})
+                               "margin":os.path.exists(MARGIN_PATH),
+                               "futures":os.path.exists(FUTURES_PATH)})
         else:
             self.send_error(404)
 
