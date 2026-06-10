@@ -281,6 +281,14 @@ def fetch_futures(date_str=None):
 
         if not rows:
             print(f"[futures] 解析無資料", flush=True)
+            # debug：印出實際欄位和前3筆
+            try:
+                if isinstance(items, list) and items:
+                    print(f"[futures] 欄位：{list(items[0].keys())}", flush=True)
+                    for item in items[:3]:
+                        print(f"[futures] 資料：{item}", flush=True)
+            except:
+                pass
             return
 
         df_new = pd.DataFrame(rows)
