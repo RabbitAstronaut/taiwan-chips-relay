@@ -221,6 +221,110 @@ def fetch_futures(date_str=None):
         query_date = f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
     except:
         return
+    # 期交所三大法人 JSON API（不需要 session）
+    url = "https://www.taifex.com.tw/cht/3/futContractsDate"
+    print(f"[futures] 抓取 {today}", flush=True)
+    rows = []
+    try:
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer": "https://www.taifex.com.tw/cht/3/futContractsDateView",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        payload = f"queryDate={query_date.replace('/', '%2F')}&commodityId="
+        r = requests.post(url, headers=hdrs, data=payload, timeout=15, verify=False)
+        r.encoding = "utf-8"
+        print(f"[futures] status={r.status_code} len={len(r.text)}", flush=True)
+
+        # 用 BeautifulSoup 解析 HTML 表格
+        try:
+            from html.parser import HTMLParser
+            import re
+            # 找所有 <tr> 行，提取文字
+            trs = re.findall(r'<TR[^>]*>(.*?)</TR>', r.text, re.DOTALL | re.IGNORECASE)
+            print(f"[futures] 找到 {len(trs)} 個 TR", flush=True)
+            all_rows = []
+            for tr in trs:
+                tds = re.findall(r'<T[HD][^>]*>(.*?)</T[HD]>', tr, re.DOTALL | re.IGNORECASE)
+                cells = [re.sub(r'<[^>]+>', '', td).strip().replace('\xa0','').replace(',','') for td in tds]
+                cells = [c for c in cells if c]
+                if cells:
+                    all_rows.append(cells)
+            print(f"[futures] 解析到 {len(all_rows)} 行，前3行={all_rows[:3]}", flush=True)
+
+            contract_map = {"臺股期貨": "TX", "小型臺指期貨": "MTX"}
+            identity_map = {"自營商": "自營商", "投信": "投信",
+                            "外資及陸資": "外資", "外資": "外資"}
+            current_contract = None
+            for cells in all_rows:
+                if len(cells) < 10:
+                    continue
+                # 判斷是否為契約名稱行
+                if cells[0] in contract_map:
+                    current_contract = contract_map[cells[0]]
+                    identity = cells[1]
+                    data_cells = cells[2:]
+                elif current_contract and cells[0] in identity_map:
+                    identity = cells[0]
+                    data_cells = cells[1:]
+                else:
+                    continue
+                identity_clean = identity_map.get(identity, "")
+                if not identity_clean:
+                    continue
+                def _n(idx):
+                    try:
+                        return int(data_cells[idx])
+                    except:
+                        return 0
+                rows.append({
+                    "futures_id": current_contract,
+                    "date": today_dash,
+                    "institutional_investors": identity_clean,
+                    "long_deal_volume":  _n(0),
+                    "long_deal_amount":  _n(1),
+                    "short_deal_volume": _n(2),
+                    "short_deal_amount": _n(3),
+                    "long_open_interest_balance_volume":  _n(6),
+                    "long_open_interest_balance_amount":  _n(7),
+                    "short_open_interest_balance_volume": _n(8),
+                    "short_open_interest_balance_amount": _n(9),
+                    "contract": current_contract,
+                    "source": "institutional",
+                })
+        except Exception as e:
+            print(f"[futures] 解析錯誤：{e}", flush=True)
+            import traceback; traceback.print_exc()
+            return
+
+        if not rows:
+            print(f"[futures] 解析無資料", flush=True)
+            return
+
+        df_new = pd.DataFrame(rows)
+        os.makedirs("data", exist_ok=True)
+        if os.path.exists(FUTURES_PATH):
+            df_old = pd.read_csv(FUTURES_PATH)
+            df_old = df_old[df_old["date"] != today_dash]
+            df_final = pd.concat([df_old, df_new], ignore_index=True)
+        else:
+            df_final = df_new
+        df_final.to_csv(FUTURES_PATH, index=False)
+        print(f"[futures] 寫入完成，共 {len(rows)} 筆", flush=True)
+        _push_to_github(FUTURES_PATH, "data/futures_data.csv")
+
+    except Exception as e:
+        import traceback
+        print(f"[futures] 錯誤：{e}", flush=True)
+        traceback.print_exc()
+    """爬取期交所三大法人未平倉（TX大台 + MTX小台）"""
+    today, today_dash = parse_date(date_str)
+    try:
+        dt = datetime.strptime(today, "%Y%m%d")
+        query_date = f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
+    except:
+        return
     url = f"https://www.taifex.com.tw/cht/3/futContractsDateDown?queryDate={query_date}&commodityId="
     print(f"[futures] 抓取 {today} query_date={query_date}", flush=True)
     rows = []
