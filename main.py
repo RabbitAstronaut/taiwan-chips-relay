@@ -554,11 +554,24 @@ def restore_from_github():
         try:
             r = requests.get(url, timeout=15)
             if r.status_code == 200:
-                # chips_twse.csv 只接受新格式（無 buy 欄位）
+                # chips_twse.csv：自動相容新舊格式
                 if local_path == "data/chips_twse.csv":
                     first_line = r.text.split("\n")[0]
                     if "buy" in first_line:
-                        print(f"[restore] ⚠️ {local_path} 為舊格式，跳過", flush=True)
+                        # 舊格式：自動轉換，只保留需要的欄位
+                        try:
+                            import io
+                            df_old = pd.read_csv(io.StringIO(r.text))
+                            _keep = [c for c in ["date","stock_id","name","net","source"] if c in df_old.columns]
+                            df_old = df_old[_keep].copy()
+                            df_old = df_old.dropna(subset=["name","net"])
+                            df_old = df_old[df_old["name"].astype(str) != "nan"]
+                            if "source" not in df_old.columns:
+                                df_old["source"] = "institutional"
+                            df_old.to_csv(local_path, index=False)
+                            print(f"[restore] ✅ {local_path}（舊格式轉換，{len(df_old)} 筆）", flush=True)
+                        except Exception as e:
+                            print(f"[restore] ⚠️ {local_path} 舊格式轉換失敗：{e}", flush=True)
                         continue
                 with open(local_path, "wb") as f:
                     f.write(r.content)
