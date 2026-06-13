@@ -127,6 +127,34 @@ def _fetch_otc(today, today_dash):
 
 GITHUB_REPO = "RabbitAstronaut/taiwan-stock-dashboard"
 
+def _push_to_cf_kv(local_path, kv_key):
+    """把本地 CSV 最新日期的資料推到 Cloudflare KV（只存今日，不存歷史）"""
+    cf_url   = os.environ.get("CF_KV_URL", "")
+    cf_token = os.environ.get("CF_KV_TOKEN", "")
+    if not cf_url or not cf_token:
+        print(f"[cf_kv] 無 CF_KV_URL 或 CF_KV_TOKEN，跳過", flush=True)
+        return
+    try:
+        df = pd.read_csv(local_path)
+        if "date" in df.columns:
+            df["date"] = df["date"].astype(str)
+            latest = df["date"].max()
+            df = df[df["date"] == latest]  # 只取最新日期
+        json_content = df.to_json(orient="records", force_ascii=False)
+        r = requests.put(
+            f"{cf_url}/put?key={kv_key}",
+            headers={"Authorization": f"Bearer {cf_token}", "Content-Type": "application/json"},
+            data=json_content,
+            timeout=15
+        )
+        if r.status_code == 200:
+            print(f"[cf_kv] ✅ 推送成功：{kv_key}（{latest}，{len(df)} 筆）", flush=True)
+        else:
+            print(f"[cf_kv] ❌ 推送失敗 {r.status_code}：{r.text[:100]}", flush=True)
+    except Exception as e:
+        print(f"[cf_kv] 錯誤：{e}", flush=True)
+
+
 def _push_to_github(local_path, github_path):
     """把本地 CSV 推回 GitHub（用 GH_TOKEN 環境變數）"""
     token = os.environ.get("GH_TOKEN", "")
@@ -165,13 +193,25 @@ def fetch_chips(date_str=None):
     os.makedirs("data", exist_ok=True)
     if os.path.exists(CSV_PATH):
         df_old = pd.read_csv(CSV_PATH)
+        # 相容舊格式（有 buy 欄位）→ 只保留需要的欄位
+        if "buy" in df_old.columns:
+            _keep = [c for c in ["date","stock_id","name","net","source"] if c in df_old.columns]
+            df_old = df_old[_keep].copy()
+            df_old = df_old.dropna(subset=["name","net"])
+            df_old = df_old[df_old["name"].astype(str) != "nan"]
+            if "source" not in df_old.columns:
+                df_old["source"] = "institutional"
+            print(f"[chips] 舊格式自動轉換，保留 {len(df_old)} 筆", flush=True)
         df_old = df_old[df_old["date"] != today_dash]
-        df_final = pd.concat([df_old, df_new], ignore_index=True)
+        cutoff = (pd.Timestamp.now() - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+        df_old = df_old[df_old["date"] >= cutoff]
+        df_final = pd.concat([df_old, df_new], ignore_index=True) if not df_old.empty else df_new
     else:
         df_final = df_new
     df_final.to_csv(CSV_PATH, index=False)
-    print(f"[chips] 寫入完成，共 {len(rows)} 筆", flush=True)
-    _push_to_github(CSV_PATH, "data/chips_twse.csv")
+    print(f"[chips] 寫入完成，共 {len(df_final)} 筆，最新日期={df_final['date'].max()}", flush=True)
+    _push_to_github(CSV_PATH, "data/chips_data.csv")
+    _push_to_cf_kv(CSV_PATH, "chips_data")
 
 
 def fetch_margin(date_str=None):
@@ -209,6 +249,7 @@ def fetch_margin(date_str=None):
         df_final.to_csv(MARGIN_PATH, index=False)
         print(f"[margin] 完成 {len(rows)} 檔", flush=True)
         _push_to_github(MARGIN_PATH, "data/margin_twse.csv")
+        _push_to_cf_kv(MARGIN_PATH, "margin_data")
     except Exception as e:
         import traceback; print(f"[margin] 錯誤：{e}",flush=True); traceback.print_exc()
 
@@ -216,307 +257,183 @@ def fetch_margin(date_str=None):
 def fetch_futures(date_str=None):
     """爬取期交所三大法人未平倉（TX大台 + MTX小台）"""
     today, today_dash = parse_date(date_str)
-    print(f"[futures] 抓取 {today}", flush=True)
-    rows = []
-    try:
-        # 期交所公開靜態 CSV（當日資料，不需 session）
-        url = "https://www.taifex.com.tw/file/taifex/CHINESE/3/IT_futContractsDate.csv"
-        r = requests.get(url, headers=HDRS, timeout=15, verify=False)
-        print(f"[futures] status={r.status_code} len={len(r.content)}", flush=True)
-        r.encoding = "big5"
-        from io import StringIO
-        lines = r.text.splitlines()
-        print(f"[futures] 前5行={lines[:5]}", flush=True)
-
-        # 找 header 行
-        header_idx = next((i for i, l in enumerate(lines) if "身份別" in l or "商品名稱" in l), None)
-        if header_idx is None:
-            print(f"[futures] 找不到 header", flush=True)
-            return
-
-        df_raw = pd.read_csv(StringIO("\n".join(lines[header_idx:])), header=0)
-        df_raw.columns = [str(c).strip() for c in df_raw.columns]
-        print(f"[futures] 欄位={list(df_raw.columns[:6])}", flush=True)
-        print(f"[futures] 前3筆={df_raw.head(3)[df_raw.columns[:4]].to_string()}", flush=True)
-
-        contract_map = {"臺股期貨": "TX", "小型臺指期貨": "MTX"}
-        identity_map = {"自營商": "自營商", "投信": "投信",
-                        "外資及陸資": "外資", "外資": "外資"}
-        name_col = next((c for c in df_raw.columns if "商品" in c), None)
-        id_col   = next((c for c in df_raw.columns if "身份" in c), None)
-        date_col = next((c for c in df_raw.columns if "日期" in c), None)
-        if not name_col or not id_col:
-            print(f"[futures] 欄位缺失", flush=True)
-            return
-
-        # 篩選今日資料
-        if date_col:
-            df_raw[date_col] = df_raw[date_col].astype(str).str.strip()
-            today_str = f"{datetime.now(TZ_TW).year}/{datetime.now(TZ_TW).month:02d}/{datetime.now(TZ_TW).day:02d}"
-            df_today = df_raw[df_raw[date_col] == today_str]
-            if df_today.empty:
-                print(f"[futures] 無今日({today_str})資料，有日期={df_raw[date_col].unique()[-3:]}", flush=True)
-                df_today = df_raw  # fallback 用全部最新
-        else:
-            df_today = df_raw
-
-        for _, row in df_today.iterrows():
-            contract_name = str(row.get(name_col, "")).strip()
-            futures_id = contract_map.get(contract_name)
-            if not futures_id:
-                continue
-            identity = str(row.get(id_col, "")).strip()
-            identity_clean = identity_map.get(identity, "")
-            if not identity_clean:
-                continue
-
-            def _n(key):
-                col = next((c for c in df_raw.columns if key in c), None)
-                if col is None: return 0
-                try: return int(str(row.get(col, 0)).replace(",", "").strip())
-                except: return 0
-
-            rows.append({
-                "futures_id": futures_id,
-                "date": today_dash,
-                "institutional_investors": identity_clean,
-                "long_deal_volume":  _n("多方交易口數"),
-                "long_deal_amount":  _n("多方交易契約金額"),
-                "short_deal_volume": _n("空方交易口數"),
-                "short_deal_amount": _n("空方交易契約金額"),
-                "long_open_interest_balance_volume":  _n("多方未平倉口數"),
-                "long_open_interest_balance_amount":  _n("多方未平倉契約金額"),
-                "short_open_interest_balance_volume": _n("空方未平倉口數"),
-                "short_open_interest_balance_amount": _n("空方未平倉契約金額"),
-                "contract": futures_id,
-                "source": "institutional",
-            })
-
-        if not rows:
-            print(f"[futures] 解析無資料", flush=True)
-            return
-
-        df_new = pd.DataFrame(rows)
-        os.makedirs("data", exist_ok=True)
-        if os.path.exists(FUTURES_PATH):
-            df_old = pd.read_csv(FUTURES_PATH)
-            df_old = df_old[df_old["date"] != today_dash]
-            df_final = pd.concat([df_old, df_new], ignore_index=True)
-        else:
-            df_final = df_new
-        df_final.to_csv(FUTURES_PATH, index=False)
-        print(f"[futures] 寫入完成，共 {len(rows)} 筆", flush=True)
-        _push_to_github(FUTURES_PATH, "data/futures_data.csv")
-
-    except Exception as e:
-        import traceback
-        print(f"[futures] 錯誤：{e}", flush=True)
-        traceback.print_exc()
-    """爬取期交所三大法人未平倉（TX大台 + MTX小台）"""
-    today, today_dash = parse_date(date_str)
     try:
         dt = datetime.strptime(today, "%Y%m%d")
         query_date = f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
     except:
         return
-    # 期交所三大法人 JSON API（不需要 session）
     url = "https://www.taifex.com.tw/cht/3/futContractsDate"
     print(f"[futures] 抓取 {today}", flush=True)
     rows = []
     try:
         hdrs = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Referer": "https://www.taifex.com.tw/cht/3/futContractsDateView",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "zh-TW,zh;q=0.9",
+            "Referer": "https://www.taifex.com.tw/cht/3/futContractsDate",
         }
-        payload = f"queryDate={query_date.replace('/', '%2F')}&commodityId="
-        r = requests.post(url, headers=hdrs, data=payload, timeout=15, verify=False)
+        s = requests.Session()
+        s.get(url, headers=hdrs, timeout=10, verify=False)
+        r = s.post(url, headers=hdrs, timeout=15, verify=False, data={
+            "queryDate": query_date,
+            "commodityId": "",
+            "queryType": "1",
+            "doQuery": "1",
+        })
         r.encoding = "utf-8"
         print(f"[futures] status={r.status_code} len={len(r.text)}", flush=True)
 
-        # 用 BeautifulSoup 解析 HTML 表格
-        try:
-            from html.parser import HTMLParser
-            import re
-            # 找所有 <tr> 行，提取文字
-            trs = re.findall(r'<TR[^>]*>(.*?)</TR>', r.text, re.DOTALL | re.IGNORECASE)
-            print(f"[futures] 找到 {len(trs)} 個 TR", flush=True)
-            all_rows = []
-            for tr in trs:
-                tds = re.findall(r'<T[HD][^>]*>(.*?)</T[HD]>', tr, re.DOTALL | re.IGNORECASE)
-                cells = [re.sub(r'<[^>]+>', '', td).strip().replace('\xa0','').replace(',','') for td in tds]
-                cells = [c for c in cells if c]
-                if cells:
-                    all_rows.append(cells)
-            print(f"[futures] 解析到 {len(all_rows)} 行，前3行={all_rows[:3]}", flush=True)
-
-            contract_map = {"臺股期貨": "TX", "小型臺指期貨": "MTX"}
-            identity_map = {"自營商": "自營商", "投信": "投信",
-                            "外資及陸資": "外資", "外資": "外資"}
-            current_contract = None
-            for cells in all_rows:
-                if len(cells) < 10:
-                    continue
-                # 判斷是否為契約名稱行
-                if cells[0] in contract_map:
-                    current_contract = contract_map[cells[0]]
-                    identity = cells[1]
-                    data_cells = cells[2:]
-                elif current_contract and cells[0] in identity_map:
-                    identity = cells[0]
-                    data_cells = cells[1:]
-                else:
-                    continue
-                identity_clean = identity_map.get(identity, "")
-                if not identity_clean:
-                    continue
-                def _n(idx):
-                    try:
-                        return int(data_cells[idx])
-                    except:
-                        return 0
-                rows.append({
-                    "futures_id": current_contract,
-                    "date": today_dash,
-                    "institutional_investors": identity_clean,
-                    "long_deal_volume":  _n(0),
-                    "long_deal_amount":  _n(1),
-                    "short_deal_volume": _n(2),
-                    "short_deal_amount": _n(3),
-                    "long_open_interest_balance_volume":  _n(6),
-                    "long_open_interest_balance_amount":  _n(7),
-                    "short_open_interest_balance_volume": _n(8),
-                    "short_open_interest_balance_amount": _n(9),
-                    "contract": current_contract,
-                    "source": "institutional",
-                })
-        except Exception as e:
-            print(f"[futures] 解析錯誤：{e}", flush=True)
-            import traceback; traceback.print_exc()
+        import re
+        tbody = re.search(r'<TBODY>(.*?)</TBODY>', r.text, re.DOTALL | re.IGNORECASE)
+        if not tbody:
+            print(f"[futures] 找不到 TBODY", flush=True)
             return
 
-        if not rows:
-            print(f"[futures] 解析無資料", flush=True)
-            return
-
-        df_new = pd.DataFrame(rows)
-        os.makedirs("data", exist_ok=True)
-        if os.path.exists(FUTURES_PATH):
-            df_old = pd.read_csv(FUTURES_PATH)
-            df_old = df_old[df_old["date"] != today_dash]
-            df_final = pd.concat([df_old, df_new], ignore_index=True)
-        else:
-            df_final = df_new
-        df_final.to_csv(FUTURES_PATH, index=False)
-        print(f"[futures] 寫入完成，共 {len(rows)} 筆", flush=True)
-        _push_to_github(FUTURES_PATH, "data/futures_data.csv")
-
-    except Exception as e:
-        import traceback
-        print(f"[futures] 錯誤：{e}", flush=True)
-        traceback.print_exc()
-    """爬取期交所三大法人未平倉（TX大台 + MTX小台）"""
-    today, today_dash = parse_date(date_str)
-    try:
-        dt = datetime.strptime(today, "%Y%m%d")
-        query_date = f"{dt.year}/{dt.month:02d}/{dt.day:02d}"
-    except:
-        return
-    url = f"https://www.taifex.com.tw/cht/3/futContractsDateDown?queryDate={query_date}&commodityId="
-    print(f"[futures] 抓取 {today} query_date={query_date}", flush=True)
-    rows = []
-    try:
-        r = requests.get(url, headers=HDRS, timeout=15, verify=False)
-        r.encoding = "big5"
-        from io import StringIO
-        # 跳過前幾行說明文字，找到 header 行
-        lines = r.text.splitlines()
-        print(f"[futures] 回應行數={len(lines)}, 前3行={lines[:3]}", flush=True)
-        # 找含有「商品名稱」或「身份別」的 header 行
-        header_idx = None
-        for i, line in enumerate(lines):
-            if "身份別" in line or "商品名稱" in line:
-                header_idx = i
-                break
-        if header_idx is None:
-            print(f"[futures] 找不到 header 行", flush=True)
-            return
-        csv_text = "\n".join(lines[header_idx:])
-        df_raw = pd.read_csv(StringIO(csv_text), header=0)
-        df_raw.columns = [str(c).strip() for c in df_raw.columns]
-        print(f"[futures] 欄位={list(df_raw.columns)}", flush=True)
-        print(f"[futures] 前3筆={df_raw.head(3).to_dict('records')}", flush=True)
+        trs = re.findall(r'<TR[^>]*>(.*?)</TR>', tbody.group(1), re.DOTALL | re.IGNORECASE)
+        print(f"[futures] 找到 {len(trs)} 個 TR", flush=True)
 
         contract_map = {"臺股期貨": "TX", "小型臺指期貨": "MTX"}
         identity_map = {"自營商": "自營商", "投信": "投信",
                         "外資及陸資": "外資", "外資": "外資"}
+        current_contract = None
 
-        # 找商品名稱欄和身份別欄
-        name_col = next((c for c in df_raw.columns if "商品" in c or "契約" in c), None)
-        id_col   = next((c for c in df_raw.columns if "身份" in c), None)
-        if not name_col or not id_col:
-            print(f"[futures] 找不到欄位 name_col={name_col} id_col={id_col}", flush=True)
-            return
-
-        for _, row in df_raw.iterrows():
-            contract_name = str(row.get(name_col, "")).strip()
-            futures_id = contract_map.get(contract_name)
-            if not futures_id:
-                continue
-            identity = str(row.get(id_col, "")).strip()
-            identity_clean = identity_map.get(identity, identity)
-            if identity_clean not in ("自營商", "投信", "外資"):
+        for tr in trs:
+            tds = re.findall(r'<T[DH][^>]*>(.*?)</T[DH]>', tr, re.DOTALL | re.IGNORECASE)
+            cells = [re.sub(r'<[^>]+>', '', td).strip().replace('\xa0','').replace(',','').replace('\n','').replace('\r','').strip() for td in tds]
+            cells = [c for c in cells if c]
+            if not cells:
                 continue
 
-            def _n(key):
-                col = next((c for c in df_raw.columns if key in c), None)
-                if col is None:
-                    return 0
+            # 找契約名稱，非 TX/MTX 的契約重置
+            all_contracts = {"臺股期貨","電子期貨","金融期貨","小型臺指期貨","微型臺指期貨",
+                             "小型電子期貨","小型金融期貨","股票期貨","ETF期貨","櫃買指數期貨",
+                             "非金電期貨","富櫃200期貨","臺灣中型100期貨","臺灣永續期貨",
+                             "臺灣生技期貨","半導體30期貨","航運期貨","東證期貨",
+                             "美國標普500期貨","美國那斯達克100期貨","美國道瓊期貨",
+                             "美國費城半導體期貨","英國富時100期貨","期貨小計"}
+            for c in cells:
+                if c in contract_map:
+                    current_contract = contract_map[c]
+                    break
+                elif c in all_contracts:
+                    current_contract = None  # 非目標契約，重置
+                    break
+
+            if not current_contract:
+                continue
+
+            identity_clean = None
+            for c in cells:
+                if c in identity_map:
+                    identity_clean = identity_map[c]
+                    break
+            if identity_clean is None and cells and cells[0] == "外資":
+                identity_clean = "外資"
+
+            if not identity_clean:
+                continue
+
+            # ── 直接從 cells 按位置取未平倉數字
+            # 表格固定結構：
+            # 自營商行(15格): [序號, 契約名, 身份別, 多交易口, 多交易金, 空交易口, 空交易金, 多空淨口, 多空淨金, 多未平口, 多未平金, 空未平口, 空未平金, 淨口, 淨金]
+            # 投信/外資行(13格): [身份別, 多交易口, 多交易金, 空交易口, 空交易金, 多空淨口, 多空淨金, 多未平口, 多未平金, 空未平口, 空未平金, 淨口, 淨金]
+            def _get_cell(idx):
                 try:
-                    return int(str(row.get(col, 0)).replace(",", "").strip())
+                    v = cells[idx].replace(',','').replace('+','').strip()
+                    return int(v) if v.lstrip('-').isdigit() else 0
                 except:
                     return 0
 
+            if len(cells) >= 15:
+                # 自營商行（有序號和契約名）
+                long_deal   = _get_cell(3)
+                short_deal  = _get_cell(5)
+                long_oi     = _get_cell(9)
+                short_oi    = _get_cell(11)
+            elif len(cells) >= 13:
+                # 投信/外資行（無序號和契約名）
+                long_deal   = _get_cell(1)
+                short_deal  = _get_cell(3)
+                long_oi     = _get_cell(7)
+                short_oi    = _get_cell(9)
+            else:
+                continue
+
             rows.append({
-                "futures_id": futures_id,
+                "futures_id": current_contract,
                 "date": today_dash,
                 "institutional_investors": identity_clean,
-                "long_deal_volume":  _n("多方交易口數"),
-                "long_deal_amount":  _n("多方交易契約金額"),
-                "short_deal_volume": _n("空方交易口數"),
-                "short_deal_amount": _n("空方交易契約金額"),
-                "long_open_interest_balance_volume":  _n("多方未平倉口數"),
-                "long_open_interest_balance_amount":  _n("多方未平倉契約金額"),
-                "short_open_interest_balance_volume": _n("空方未平倉口數"),
-                "short_open_interest_balance_amount": _n("空方未平倉契約金額"),
-                "contract": futures_id,
+                "long_deal_volume":  long_deal,
+                "long_deal_amount":  _get_cell(4) if len(cells) >= 15 else _get_cell(2),
+                "short_deal_volume": short_deal,
+                "short_deal_amount": _get_cell(6) if len(cells) >= 15 else _get_cell(4),
+                "long_open_interest_balance_volume":  long_oi,
+                "long_open_interest_balance_amount":  _get_cell(10) if len(cells) >= 15 else _get_cell(8),
+                "short_open_interest_balance_volume": short_oi,
+                "short_open_interest_balance_amount": _get_cell(12) if len(cells) >= 15 else _get_cell(10),
+                "contract": current_contract,
                 "source": "institutional",
             })
 
+        print(f"[futures] 解析到 {len(rows)} 筆", flush=True)
         if not rows:
-            print(f"[futures] 解析無資料", flush=True)
             return
 
         df_new = pd.DataFrame(rows)
         os.makedirs("data", exist_ok=True)
         if os.path.exists(FUTURES_PATH):
             df_old = pd.read_csv(FUTURES_PATH)
-            df_old = df_old[df_old["date"] != today_dash]
-            df_final = pd.concat([df_old, df_new], ignore_index=True)
+            if "buy" not in df_old.columns:
+                df_old = df_old[df_old["date"] != today_dash]
+                df_final = pd.concat([df_old, df_new], ignore_index=True)
+            else:
+                df_final = df_new
         else:
             df_final = df_new
         df_final.to_csv(FUTURES_PATH, index=False)
-        print(f"[futures] 寫入完成，共 {len(rows)} 筆", flush=True)
+        print(f"[futures] 寫入完成，共 {len(df_final)} 筆，最新日期={df_final['date'].max()}", flush=True)
         _push_to_github(FUTURES_PATH, "data/futures_data.csv")
+        _push_to_cf_kv(FUTURES_PATH, "futures_data")
 
     except Exception as e:
         import traceback
         print(f"[futures] 錯誤：{e}", flush=True)
         traceback.print_exc()
 
+def trigger_github_actions():
+    """觸發 GitHub Actions daily_update workflow"""
+    token = os.environ.get("GH_TOKEN", "")
+    if not token:
+        return
+    try:
+        url = "https://api.github.com/repos/RabbitAstronaut/taiwan-stock-dashboard/actions/workflows/daily_update.yml/dispatches"
+        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+        r = requests.post(url, headers=headers, json={"ref": "main"}, timeout=10)
+        if r.status_code == 204:
+            print(f"[actions] ✅ 已觸發 GitHub Actions", flush=True)
+        else:
+            print(f"[actions] ❌ 觸發失敗 {r.status_code}: {r.text[:100]}", flush=True)
+    except Exception as e:
+        print(f"[actions] 錯誤：{e}", flush=True)
+
 
 def has_today_data(csv_path):
+    """檢查 CSV 是否已有今日 TWSE 和 OTC 的資料（兩者都要有才算完整）"""
+    try:
+        if not os.path.exists(csv_path):
+            return False
+        df = pd.read_csv(csv_path)
+        today_dash = datetime.now(TZ_TW).strftime("%Y-%m-%d")
+        today_df = df[df["date"] == today_dash]
+        has_twse = "twse" in today_df["source"].values
+        has_otc  = "otc"  in today_df["source"].values
+        if not has_twse:
+            print(f"[has_today_data] TWSE 尚無資料", flush=True)
+        if not has_otc:
+            print(f"[has_today_data] OTC 尚無資料", flush=True)
+        return has_twse and has_otc
+    except:
+        return False
     """檢查 CSV 是否已有今日 TWSE 和 OTC 的資料（兩者都要有才算完整）"""
     try:
         if not os.path.exists(csv_path):
@@ -546,6 +463,7 @@ def scheduler():
     FUTURES_START = (16,  0)
     MARGIN_START  = (16, 35)
     DEADLINE      = (17, 30)
+    gh_triggered  = False
 
     while True:
         now = datetime.now(TZ_TW)
@@ -555,6 +473,7 @@ def scheduler():
             chips_ok = margin_ok = futures_ok = False
             chips_last_try = margin_last_try = futures_last_try = 0
             last_date = today
+            gh_triggered = False
             global TARGET_STOCKS
             TARGET_STOCKS = load_target_stocks()
 
@@ -614,9 +533,42 @@ def scheduler():
                 print(f"[margin] ❌ 已超過17:30，今日放棄重試", flush=True)
                 margin_ok = True
 
+            # ── 17:35 觸發 GitHub Actions（補抓 K線/財務等資料）
+            if now_mins >= 17*60+35 and not gh_triggered:
+                print(f"[actions] 17:35 觸發 GitHub Actions...", flush=True)
+                trigger_github_actions()
+                gh_triggered = True
+
         time.sleep(30)
 
 
+def restore_from_github():
+    """啟動時從 GitHub 還原 CSV 資料到容器"""
+    files = {
+        "data/chips_twse.csv":   "https://raw.githubusercontent.com/RabbitAstronaut/taiwan-stock-dashboard/main/data/chips_data.csv",
+        "data/margin_twse.csv":  "https://raw.githubusercontent.com/RabbitAstronaut/taiwan-stock-dashboard/main/data/margin_twse.csv",
+        "data/futures_data.csv": "https://raw.githubusercontent.com/RabbitAstronaut/taiwan-stock-dashboard/main/data/futures_data.csv",
+    }
+    os.makedirs("data", exist_ok=True)
+    for local_path, url in files.items():
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                # chips_twse.csv 只接受新格式（無 buy 欄位）
+                if local_path == "data/chips_twse.csv":
+                    first_line = r.text.split("\n")[0]
+                    if "buy" in first_line:
+                        print(f"[restore] ⚠️ {local_path} 為舊格式，跳過", flush=True)
+                        continue
+                with open(local_path, "wb") as f:
+                    f.write(r.content)
+                print(f"[restore] ✅ {local_path}", flush=True)
+            else:
+                print(f"[restore] ⚠️ {local_path} status={r.status_code}", flush=True)
+        except Exception as e:
+            print(f"[restore] ❌ {local_path} 錯誤：{e}", flush=True)
+
+restore_from_github()
 threading.Thread(target=scheduler, daemon=True).start()
 
 
@@ -639,13 +591,15 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_csv(FUTURES_PATH)
         elif path == "/api/fetch_now":
             date_str = qs.get("date",[None])[0]
-            fetch_chips(date_str)
-            fetch_margin(date_str)
-            fetch_futures(date_str)
-            self._respond(200,{"status":"done","date":date_str or "today",
-                               "chips":os.path.exists(CSV_PATH),
-                               "margin":os.path.exists(MARGIN_PATH),
-                               "futures":os.path.exists(FUTURES_PATH)})
+            # 背景執行，立即回傳避免超時
+            import threading as _t
+            def _run():
+                fetch_chips(date_str)
+                fetch_margin(date_str)
+                fetch_futures(date_str)
+            _t.Thread(target=_run, daemon=True).start()
+            self._respond(200,{"status":"started","date":date_str or "today",
+                               "message":"抓取已在背景啟動，30秒後查看 /api/chips"})
         else:
             self.send_error(404)
 
