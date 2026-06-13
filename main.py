@@ -215,8 +215,11 @@ def fetch_chips(date_str=None):
 
 
 def fetch_margin(date_str=None):
-    """爬取上市融資融券"""
+    """爬取上市+上櫃融資融券"""
     today, today_dash = parse_date(date_str)
+    rows = []
+
+    # ── 上市（TWSE）
     url = f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={today}&selectType=stock&response=json"
     print(f"[margin] 抓取 {today}", flush=True)
     try:
@@ -224,34 +227,63 @@ def fetch_margin(date_str=None):
         d = r.json()
         tables = d.get("tables", [])
         if not tables:
-            print(f"[margin] 尚未公布", flush=True)
-            return
-        rows = []
-        for row in tables[0].get("data", []):
-            code = str(row[0]).strip()
-            if code not in TARGET_STOCKS: continue
-            rows.append({
-                "date": today_dash, "stock_id": code,
-                "margin_balance": clean_num(row[4]),
-                "short_balance":  clean_num(row[10]),
-                "source": "margin"
-            })
-        if not rows:
-            return
-        df_new = pd.DataFrame(rows)
-        os.makedirs("data", exist_ok=True)
-        if os.path.exists(MARGIN_PATH):
-            df_old = pd.read_csv(MARGIN_PATH)
-            df_old = df_old[df_old["date"] != today_dash]
-            df_final = pd.concat([df_old, df_new], ignore_index=True)
+            print(f"[margin] TWSE 尚未公布", flush=True)
         else:
-            df_final = df_new
-        df_final.to_csv(MARGIN_PATH, index=False)
-        print(f"[margin] 完成 {len(rows)} 檔", flush=True)
-        _push_to_github(MARGIN_PATH, "data/margin_twse.csv")
-        _push_to_cf_kv(MARGIN_PATH, "margin_data")
+            for row in tables[0].get("data", []):
+                code = str(row[0]).strip()
+                if code not in TARGET_STOCKS: continue
+                rows.append({
+                    "date": today_dash, "stock_id": code,
+                    "margin_balance": clean_num(row[4]),
+                    "short_balance":  clean_num(row[10]),
+                    "source": "margin"
+                })
+            print(f"[margin] TWSE 完成 {len(rows)} 檔", flush=True)
     except Exception as e:
-        import traceback; print(f"[margin] 錯誤：{e}",flush=True); traceback.print_exc()
+        print(f"[margin] TWSE 錯誤：{e}", flush=True)
+
+    # ── 上櫃（OTC/TPEx）
+    try:
+        roc_year = today.year - 1911
+        roc_date = f"{roc_year}/{today.month:02d}/{today.day:02d}"
+        otc_url = f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?l=zh-tw&o=json&d={roc_date}&s=0,asc"
+        r2 = requests.get(otc_url, headers=HDRS, timeout=15, verify=False)
+        d2 = r2.json()
+        data2 = d2.get("aaData", [])
+        if not data2:
+            print(f"[margin] OTC 尚未公布", flush=True)
+        else:
+            otc_count = 0
+            for row in data2:
+                code = str(row[0]).strip()
+                if code not in TARGET_STOCKS: continue
+                rows.append({
+                    "date": today_dash, "stock_id": code,
+                    "margin_balance": clean_num(row[4]),
+                    "short_balance":  clean_num(row[10]) if len(row) > 10 else 0,
+                    "source": "margin"
+                })
+                otc_count += 1
+            print(f"[margin] OTC 完成 {otc_count} 檔", flush=True)
+    except Exception as e:
+        print(f"[margin] OTC 錯誤：{e}", flush=True)
+
+    if not rows:
+        print(f"[margin] 尚無資料", flush=True)
+        return
+
+    df_new = pd.DataFrame(rows)
+    os.makedirs("data", exist_ok=True)
+    if os.path.exists(MARGIN_PATH):
+        df_old = pd.read_csv(MARGIN_PATH)
+        df_old = df_old[df_old["date"] != today_dash]
+        df_final = pd.concat([df_old, df_new], ignore_index=True)
+    else:
+        df_final = df_new
+    df_final.to_csv(MARGIN_PATH, index=False)
+    print(f"[margin] 寫入完成，共 {len(df_final)} 筆", flush=True)
+    _push_to_github(MARGIN_PATH, "data/margin_twse.csv")
+    _push_to_cf_kv(MARGIN_PATH, "margin_data")
 
 
 def fetch_futures(date_str=None):
